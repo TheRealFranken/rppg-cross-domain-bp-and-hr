@@ -1,0 +1,13 @@
+# Notebook/runtime support
+jupyter
+ipykernel
+
+# Core project dependencies found in rppg.ipynb
+numpy
+pandas
+opencv-python
+matplotlib
+tqdm
+mediapipe
+scipy
+torch

@@ -1,0 +1,6 @@
+.venv/
+.venv-gpu/
+.venv312/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
