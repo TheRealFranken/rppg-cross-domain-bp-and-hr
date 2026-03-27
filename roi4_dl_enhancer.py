@@ -112,6 +112,26 @@ def temporal_derivative(sig):
     return standardize(diff)
 
 
+def normalized_rgb_features(trace):
+    trace = np.asarray(trace, dtype=np.float64)
+    denom = np.sum(trace, axis=1, keepdims=True) + 1e-8
+    rgb_norm = trace / denom
+    return np.vstack([standardize(rgb_norm[:, i]) for i in range(3)])
+
+
+def yuv_features(trace):
+    trace = np.asarray(trace, dtype=np.float64)
+    r = trace[:, 0]
+    g = trace[:, 1]
+    b = trace[:, 2]
+
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    u = -0.14713 * r - 0.28886 * g + 0.436 * b
+    v = 0.615 * r - 0.51499 * g - 0.10001 * b
+
+    return np.vstack([standardize(y), standardize(u), standardize(v)])
+
+
 def extract_patch_feature_bank(subject_path, face_mesh, top_k_patches=5, min_frames=200):
     videos = [name for name in os.listdir(subject_path) if name.lower().endswith(VIDEO_EXTS)]
     if not videos:
@@ -149,6 +169,8 @@ def extract_patch_feature_bank(subject_path, face_mesh, top_k_patches=5, min_fra
                     temporal_derivative(chrom_sig),
                     temporal_derivative(pos_sig),
                     temporal_derivative(green_sig),
+                    *normalized_rgb_features(trace),
+                    *yuv_features(trace),
                 ]
             )
         )
@@ -156,8 +178,11 @@ def extract_patch_feature_bank(subject_path, face_mesh, top_k_patches=5, min_fra
     top_idx = np.argsort(np.asarray(patch_scores))[::-1][:top_k_patches]
     selected = [patch_features[i] for i in top_idx]
     x = np.concatenate(selected, axis=0)
-    fused_baseline = standardize(np.mean(x[: 3 * len(selected) : 3], axis=0)) if len(selected) > 0 else standardize(np.mean(x, axis=0))
-    fused_baseline = standardize(np.mean(x[: min(3, x.shape[0]), :], axis=0))
+    baseline_components = []
+    for local_idx in range(len(selected)):
+        base = selected[local_idx][:3, :]
+        baseline_components.append(np.mean(base, axis=0))
+    fused_baseline = standardize(np.mean(np.vstack(baseline_components), axis=0))
     fused_derivative = temporal_derivative(fused_baseline)
     x = np.vstack([x, fused_baseline[None, :], fused_derivative[None, :]])
 
@@ -175,6 +200,7 @@ def extract_patch_feature_bank(subject_path, face_mesh, top_k_patches=5, min_fra
         "fps": fps,
         "x": x.astype(np.float32),
         "y": y.astype(np.float32),
+        "baseline": fused_baseline[:n].astype(np.float32),
         "channels": x.shape[0],
         "length": n,
         "top_patch_indices": top_idx.tolist(),
@@ -186,45 +212,78 @@ def window_quality(sig, fs):
     return patch_quality(sig, fs)
 
 
-def make_windows(x, y, fs, window_size=256, stride=64, min_window_quality=0.5):
+def make_windows(x, y, baseline, fs, window_size=256, stride=64, min_window_quality=0.5):
     xs = []
     ys = []
+    bs = []
     n = len(y)
     if n < window_size:
-        return xs, ys
+        return xs, ys, bs
 
     for start in range(0, n - window_size + 1, stride):
         end = start + window_size
         xw = x[:, start:end]
         yw = y[start:end]
+        bw = baseline[start:end]
         if window_quality(yw, fs) < min_window_quality:
             continue
         xs.append(xw)
         ys.append(yw)
+        bs.append(bw)
 
-    return xs, ys
+    return xs, ys, bs
+
+
+def augment_window(x, y):
+    x = x.copy()
+    y = y.copy()
+
+    if np.random.rand() < 0.8:
+        x *= np.random.uniform(0.9, 1.1)
+
+    if np.random.rand() < 0.8:
+        x += np.random.normal(0.0, 0.01, size=x.shape)
+
+    if np.random.rand() < 0.3:
+        ch = np.random.randint(0, x.shape[0])
+        x[ch] *= np.random.uniform(0.0, 0.3)
+
+    if np.random.rand() < 0.4 and x.shape[1] > 32:
+        span = np.random.randint(8, min(24, x.shape[1] // 4))
+        start = np.random.randint(0, x.shape[1] - span)
+        x[:, start : start + span] = 0.0
+
+    return x, y
 
 
 class WindowDataset(Dataset):
-    def __init__(self, feature_dicts, window_size=256, stride=64, min_window_quality=0.5):
+    def __init__(self, feature_dicts, window_size=256, stride=64, min_window_quality=0.5, augment=False):
         self.samples = []
+        self.augment = augment
         for item in feature_dicts:
-            xs, ys = make_windows(
+            xs, ys, bs = make_windows(
                 item["x"],
                 item["y"],
+                item["baseline"],
                 item["fps"],
                 window_size=window_size,
                 stride=stride,
                 min_window_quality=min_window_quality,
             )
-            self.samples.extend(list(zip(xs, ys)))
+            self.samples.extend(list(zip(xs, ys, bs)))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        x, y = self.samples[idx]
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+        x, y, b = self.samples[idx]
+        if self.augment:
+            x, y = augment_window(x, y)
+        return (
+            torch.tensor(x, dtype=torch.float32),
+            torch.tensor(y, dtype=torch.float32),
+            torch.tensor(b, dtype=torch.float32),
+        )
 
 
 class ResidualBlock1D(nn.Module):
@@ -255,13 +314,22 @@ class PulseEnhancerNet(nn.Module):
             nn.GELU(),
             nn.Conv1d(hidden, 1, kernel_size=1),
         )
+        self.gate = nn.Sequential(
+            nn.Conv1d(hidden, hidden, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(hidden, 1, kernel_size=1),
+            nn.Tanh(),
+        )
 
-    def forward(self, x):
+    def forward(self, x, baseline=None):
         x = self.input_proj(x)
         for block in self.blocks:
             x = block(x)
-        x = self.head(x)
-        return x[:, 0, :]
+        residual = self.head(x)[:, 0, :]
+        if baseline is None:
+            return residual
+        gate = self.gate(x)[:, 0, :]
+        return baseline + 0.5 * gate * residual
 
 
 def pearson_loss(pred, target):
@@ -361,12 +429,14 @@ def train_model_from_items(
         window_size=window_size,
         stride=stride,
         min_window_quality=min_window_quality,
+        augment=True,
     )
     val_ds = WindowDataset(
         val_items,
         window_size=window_size,
         stride=stride,
         min_window_quality=min_window_quality,
+        augment=False,
     ) if val_items else None
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
@@ -393,12 +463,13 @@ def train_model_from_items(
         model.train()
         train_losses = []
 
-        for xb, yb in train_loader:
+        for xb, yb, bb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
+            bb = bb.to(device)
 
             optimizer.zero_grad()
-            pred = model(xb)
+            pred = model(xb, baseline=bb)
             loss = composite_loss(pred, yb)
             loss.backward()
             optimizer.step()
@@ -411,10 +482,11 @@ def train_model_from_items(
             model.eval()
             val_losses = []
             with torch.no_grad():
-                for xb, yb in val_loader:
+                for xb, yb, bb in val_loader:
                     xb = xb.to(device)
                     yb = yb.to(device)
-                    pred = model(xb)
+                    bb = bb.to(device)
+                    pred = model(xb, baseline=bb)
                     loss = composite_loss(pred, yb)
                     val_losses.append(float(loss.item()))
 
@@ -489,7 +561,7 @@ def train_roi4_dl_model(
     }
 
 
-def predict_full_signal(model, x, window_size=256, stride=64, device=None):
+def predict_full_signal(model, x, baseline, window_size=256, stride=64, device=None):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -499,8 +571,9 @@ def predict_full_signal(model, x, window_size=256, stride=64, device=None):
     n = x.shape[1]
     if n < window_size:
         xb = torch.tensor(x[None, :, :], dtype=torch.float32, device=device)
+        bb = torch.tensor(baseline[None, :], dtype=torch.float32, device=device)
         with torch.no_grad():
-            pred = model(xb)[0].detach().cpu().numpy()
+            pred = model(xb, baseline=bb)[0].detach().cpu().numpy()
         return standardize(pred)
 
     acc = np.zeros(n, dtype=np.float64)
@@ -515,7 +588,8 @@ def predict_full_signal(model, x, window_size=256, stride=64, device=None):
         for start in starts:
             end = start + window_size
             xb = torch.tensor(x[:, start:end][None, :, :], dtype=torch.float32, device=device)
-            pred = model(xb)[0].detach().cpu().numpy()
+            bb = torch.tensor(baseline[start:end][None, :], dtype=torch.float32, device=device)
+            pred = model(xb, baseline=bb)[0].detach().cpu().numpy()
             acc[start:end] += pred * win
             norm[start:end] += win
 
@@ -552,6 +626,7 @@ def evaluate_roi4_dl_model(root, artifacts, min_frames=200):
             pred = predict_full_signal(
                 model,
                 item["x"],
+                item["baseline"],
                 window_size=window_size,
                 stride=stride,
                 device=device,
@@ -583,12 +658,13 @@ def _make_folds(items, num_folds=5, seed=42):
     return [fold for fold in folds if fold]
 
 
-def _predict_ensemble(models, x, window_size, stride, device=None):
+def _predict_ensemble(models, x, baseline, window_size, stride, device=None):
     preds = []
     for model in models:
         pred = predict_full_signal(
             model,
             x,
+            baseline,
             window_size=window_size,
             stride=stride,
             device=device,
@@ -656,6 +732,7 @@ def evaluate_roi4_dl_model_unbiased(
             pred = _predict_ensemble(
                 fold_models,
                 item["x"],
+                item["baseline"],
                 window_size=window_size,
                 stride=stride,
                 device=device,
